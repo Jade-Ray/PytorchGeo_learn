@@ -32,15 +32,15 @@ class SEALDataset(InMemoryDataset):
         self.data = dataset[0]
         self.num_hops = num_hops
         super().__init__(dataset.root)
-        index = ['train', 'val', 'test'].index(split)
+        index = ['train', 'val', 'test', 'all'].index(split)
         self.data, self.slices = torch.load(self.processed_paths[index])
         
     @property
     def processed_file_names(self):
-        return ['SEAL_train_data.pt', 'SEAL_val_data.pt', 'SEAL_test_data.pt']
+        return ['SEAL_train_data.pt', 'SEAL_val_data.pt', 'SEAL_test_data.pt', 'SEAL_all_data.pt']
     
     def process(self):
-        transform = RandomLinkSplit(num_val=-.05, num_test=0.1, is_undirected=True, split_labels=True)
+        transform = RandomLinkSplit(num_val=0.05, num_test=0.1, is_undirected=True, split_labels=True)
         train_data, val_data, test_data = transform(self.data)
         
         self._max_z = 0
@@ -69,8 +69,11 @@ class SEALDataset(InMemoryDataset):
             data.x = F.one_hot(data.z, self._max_z + 1).to(torch.float)
             
         torch.save(self.collate(train_pos_data_list + train_neg_data_list), self.processed_paths[0])
-        torch.save(self.collate(val_pos_data_list, val_neg_data_list), self.processed_paths[1])
+        torch.save(self.collate(val_pos_data_list + val_neg_data_list), self.processed_paths[1])
         torch.save(self.collate(test_pos_data_list + test_neg_data_list), self.processed_paths[2])
+        torch.save(self.collate(train_pos_data_list + train_neg_data_list +
+                                val_pos_data_list + val_neg_data_list +
+                                test_pos_data_list + test_neg_data_list), self.processed_paths[3])
         
     def extract_enclosing_subgraphs(self, edge_index, edge_label_index, y):
         data_list = []
@@ -112,7 +115,7 @@ class SEALDataset(InMemoryDataset):
         dist2dst = torch.from_numpy(dist2dst)
         
         dist = dist2src + dist2dst
-        dist_over_2, dist_mod_2 = dist // 2, dist % 2
+        dist_over_2, dist_mod_2 = torch.div(dist, 2, rounding_mode='floor'), dist % 2
         
         z = 1 + torch.min(dist2src, dist2dst)
         z += dist_over_2 * (dist_over_2 + dist_mod_2 - 1)
@@ -130,9 +133,9 @@ train_dataset = SEALDataset(dataset, num_hops=2, split='train')
 val_dataset = SEALDataset(dataset, num_hops=2, split='val')
 test_dataset = SEALDataset(dataset, num_hops=2, split='test')
 
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=32)
-test_loader = DataLoader(test_dataset, batch_size=32)
+train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=512)
+test_loader = DataLoader(test_dataset, batch_size=512)
 
 # %% [markdown]
 # The DGCNN model
@@ -240,3 +243,30 @@ for epoch in range(1, 51):
         test_auc = test(test_loader)
     print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Val: {val_auc:.4f}, '
           f'Test: {test_auc:.4f}')    
+
+# %% [markdown]
+# Prediction
+
+# %%
+pred_dataset = SEALDataset(dataset, num_hops=2, split='all')
+
+@torch.no_grad()
+def predict(dataset, threshold=0.5, batch_size=512):
+    loader = DataLoader(dataset, batch_size=batch_size)
+    selected_edge_index = torch.zeros(2, 0)
+    model.eval()
+    
+    for j, data in enumerate(loader):
+        data = data.to(device)
+        logits = model(data.x, data.edge_index, data.batch)
+        logits = logits.view(-1).sigmoid()
+        selected_batch_index = (logits > threshold).nonzero(as_tuple=True)[0]
+        selected_batch_index += batch_size * j
+        for i in selected_batch_index:
+            selected_edge_index = torch.cat((selected_edge_index, dataset[i].edge_index), dim=-1)
+            
+    return selected_edge_index
+
+selected_edge_index = predict(pred_dataset)
+# remove duplicate edges
+selected_edge_index = torch.unique(selected_edge_index, dim=1).type(torch.int)
